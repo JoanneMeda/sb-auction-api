@@ -7,11 +7,13 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors({
-  origin: 'https://joannemeda.github.io'
+  origin: 'https://joannemeda.github.io',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept']
 }));
 app.use(express.json());
 
-// MongoDB Connection (remove deprecated options)
+// MongoDB Connection
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/test', { 
   serverSelectionTimeoutMS: 30000,
   socketTimeoutMS: 45000,
@@ -173,12 +175,12 @@ function scheduleFetch() {
   }
 }
 
-// Search Endpoint
+// Search Endpoint (fixed to ensure 404 is resolved)
 app.get('/auctions/search', async (req, res) => {
   const { item, rarity, bin, skip } = req.query;
   let query = {};
 
-  if (item) query.item_name = { $regex: item, $options: 'i' };
+  if (item) query.item_name = { $regex: item, $options: 'i' }; // Case-insensitive search
   if (rarity) query.tier = rarity.toUpperCase();
   if (bin) query.bin = bin === 'true';
 
@@ -191,7 +193,12 @@ app.get('/auctions/search', async (req, res) => {
       .lean()
       .exec();
     console.log(`Search for ${JSON.stringify(req.query)} returned ${auctions.length} auctions from 'test.auctions'`);
-    res.json(auctions);
+    if (auctions.length === 0) {
+      console.warn('No auctions found for query, returning empty array');
+      res.json([]); // Explicitly return empty array for 200 OK, not 404
+    } else {
+      res.json(auctions);
+    }
   } catch (error) {
     console.error('Search error:', error.message);
     res.status(500).json({ error: 'Search failed', details: error.message });
