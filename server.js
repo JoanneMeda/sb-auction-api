@@ -14,8 +14,8 @@ app.use(express.json());
 // Load environment variables
 require('dotenv').config();
 
-// MongoDB Connection (using MongoDB Atlas SRV connection string)
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/skyblock_auctions', { 
+// MongoDB Connection (using MongoDB Atlas SRV connection string, updated to 'test' database)
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/test', { 
   useNewUrlParser: true, 
   useUnifiedTopology: true,
   serverSelectionTimeoutMS: 30000, // 30 seconds
@@ -37,7 +37,7 @@ const auctionSchema = new mongoose.Schema({
   end: Number,
   item_lore: String
 });
-const Auction = mongoose.model('Auction', auctionSchema);
+const Auction = mongoose.model('auctions', auctionSchema); // Updated collection name to match screenshot
 
 // Historical Auction Schema (with manual cleanup for expiration)
 const historicalAuctionSchema = new mongoose.Schema({
@@ -56,7 +56,7 @@ historicalAuctionSchema.index({ auctioneer: 1 });
 historicalAuctionSchema.index({ item_name: 1 });
 historicalAuctionSchema.index({ end: 1 }); // For cleanup queries
 
-const HistoricalAuction = mongoose.model('HistoricalAuction', historicalAuctionSchema);
+const HistoricalAuction = mongoose.model('historicalauctions', historicalAuctionSchema); // Updated collection name to match screenshot
 
 const API_ENDPOINT = `https://api.hypixel.net/skyblock/auctions?key=${process.env.HYPIXEL_API_KEY}`;
 
@@ -163,9 +163,9 @@ cron.schedule('*/5 * * * *', () => {
     .catch(err => console.error('Cron job failed:', err.message));
 });
 
-// Search Endpoint (current auctions, querying cached data)
+// Search Endpoint (current auctions, querying cached data from 'test' database)
 app.get('/auctions/search', async (req, res) => {
-  const { item, rarity, bin, skip } = req.query; // Removed ign for simplicity, as per frontend
+  const { item, rarity, bin, skip } = req.query;
   let query = {};
 
   if (item) query.item_name = { $regex: item, $options: 'i' };
@@ -180,11 +180,22 @@ app.get('/auctions/search', async (req, res) => {
       .limit(100)
       .lean() // Use lean for faster queries
       .exec();
-    console.log(`Search for ${JSON.stringify(req.query)} returned ${auctions.length} auctions`);
+    console.log(`Search for ${JSON.stringify(req.query)} returned ${auctions.length} auctions from 'test.auctions'`);
     res.json(auctions);
   } catch (error) {
     console.error('Search error:', error.message);
     res.status(500).json({ error: 'Search failed', details: error.message });
+  }
+});
+
+// Health check endpoint for frontend verification
+app.get('/health', async (req, res) => {
+  try {
+    await mongoose.connection.db.admin().ping();
+    res.json({ connected: true, message: 'MongoDB connection healthy' });
+  } catch (error) {
+    console.error('Health check error:', error.message);
+    res.status(500).json({ connected: false, message: 'MongoDB connection failed' });
   }
 });
 
