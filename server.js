@@ -66,9 +66,9 @@ async function fetchAuctionsWithRetry(retries = 5, delay = 30000) {
       console.log(`Fetching ${totalPages} pages...`);
 
       const pagePromises = [];
-      const batchSize = 10; // Fetch 10 pages at a time to reduce memory
-      for (let i = 0; i < totalPages; i += batchSize) {
-        const batchPages = Array.from({ length: Math.min(batchSize, totalPages - i) }, (_, j) => i + j);
+      const apiBatchSize = 5; // Fetch 5 pages at a time to reduce memory
+      for (let i = 0; i < totalPages; i += apiBatchSize) {
+        const batchPages = Array.from({ length: Math.min(apiBatchSize, totalPages - i) }, (_, j) => i + j);
         pagePromises.push(
           Promise.all(batchPages.map(page =>
             axios.get(`${API_ENDPOINT}&page=${page}`, { timeout: 30000 }).then(res => {
@@ -117,11 +117,11 @@ async function fetchAuctionsWithRetry(retries = 5, delay = 30000) {
         console.log('Collection didn’t exist or dropped');
       });
       console.log('Inserting new auctions in batches...');
-      const batchSize = 1000;
-      for (let i = 0; i < allAuctions.length; i += batchSize) {
-        const batch = allAuctions.slice(i, i + batchSize);
+      const mongoBatchSize = 1000; // Separate variable to avoid redeclaration
+      for (let i = 0; i < allAuctions.length; i += mongoBatchSize) {
+        const batch = allAuctions.slice(i, i + mongoBatchSize);
         await Auction.insertMany(batch, { ordered: false });
-        console.log(`Inserted batch ${i / batchSize + 1} of ${Math.ceil(allAuctions.length / batchSize)}`);
+        console.log(`Inserted batch ${i / mongoBatchSize + 1} of ${Math.ceil(allAuctions.length / mongoBatchSize)}`);
       }
       console.log(`Cached ${allAuctions.length} auctions successfully`);
       return;
