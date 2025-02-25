@@ -3,28 +3,23 @@ const axios = require('axios');
 const mongoose = require('mongoose');
 const cron = require('node-cron');
 const cors = require('cors');
-const app = express();
+require('dotenv').config();
 
-// Middleware
+const app = express();
 app.use(cors({
-  origin: 'https://joannemeda.github.io' // Explicitly allow GitHub Pages
+  origin: 'https://joannemeda.github.io'
 }));
 app.use(express.json());
 
-// Load environment variables
-require('dotenv').config();
-
-// MongoDB Connection (using MongoDB Atlas SRV connection string, updated to 'test' database)
+// MongoDB Connection (remove deprecated options)
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/test', { 
-  useNewUrlParser: true, 
-  useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 30000, // 30 seconds
-  socketTimeoutMS: 45000, // 45 seconds
-  heartbeatFrequencyMS: 10000, // Check connection every 10 seconds
-  maxPoolSize: 10 // Increase connection pool size
+  serverSelectionTimeoutMS: 30000,
+  socketTimeoutMS: 45000,
+  heartbeatFrequencyMS: 10000,
+  maxPoolSize: 10
 })
-  .then(() => console.log('Connected to MongoDB successfully'))
-  .catch(err => console.error('MongoDB connection failed:', err.message));
+.then(() => console.log('Connected to MongoDB successfully'))
+.catch(err => console.error('MongoDB connection failed:', err.message));
 
 // Auction Schema (current auctions)
 const auctionSchema = new mongoose.Schema({
@@ -37,31 +32,30 @@ const auctionSchema = new mongoose.Schema({
   end: Number,
   item_lore: String
 });
-const Auction = mongoose.model('auctions', auctionSchema); // Updated collection name to match screenshot
+const Auction = mongoose.model('auctions', auctionSchema);
 
-// Historical Auction Schema (with manual cleanup for expiration)
+// Historical Auction Schema
 const historicalAuctionSchema = new mongoose.Schema({
-    _id: String, // auction uuid
-    item_name: String,
-    starting_bid: Number,
-    tier: String,
-    bin: Boolean,
-    end: Number, // Hypixel end time in milliseconds
-    auctioneer: String,
-    first_seen: { type: Date, default: Date.now }
+  _id: String, // auction uuid
+  item_name: String,
+  starting_bid: Number,
+  tier: String,
+  bin: Boolean,
+  end: Number,
+  auctioneer: String,
+  first_seen: { type: Date, default: Date.now }
 }, { timestamps: true });
 
-// Define indexes on the schema
 historicalAuctionSchema.index({ auctioneer: 1 });
 historicalAuctionSchema.index({ item_name: 1 });
-historicalAuctionSchema.index({ end: 1 }); // For cleanup queries
+historicalAuctionSchema.index({ end: 1 });
 
-const HistoricalAuction = mongoose.model('historicalauctions', historicalAuctionSchema); // Updated collection name to match screenshot
+const HistoricalAuction = mongoose.model('historicalauctions', historicalAuctionSchema);
 
 const API_ENDPOINT = `https://api.hypixel.net/skyblock/auctions?key=${process.env.HYPIXEL_API_KEY}`;
 
-// Function to fetch auctions with retry logic and historical storage
-async function fetchAuctionsWithRetry(retries = 3, delay = 30000) {
+// Function to fetch auctions with retry logic, batching, and duplicate handling
+async function fetchAuctionsWithRetry(retries = 5, delay = 30000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       console.log(`Starting auction fetch (Attempt ${attempt}/${retries}) at ${new Date().toISOString()}...`);
@@ -72,42 +66,51 @@ async function fetchAuctionsWithRetry(retries = 3, delay = 30000) {
       console.log(`Fetching ${totalPages} pages...`);
 
       const pagePromises = [];
-      for (let i = 0; i < totalPages; i++) {
+      const batchSize = 10; // Fetch 10 pages at a time to reduce memory
+      for (let i = 0; i < totalPages; i += batchSize) {
+        const batchPages = Array.from({ length: Math.min(batchSize, totalPages - i) }, (_, j) => i + j);
         pagePromises.push(
-          axios.get(`${API_ENDPOINT}&page=${i}`, { timeout: 30000 }).then(res => {
-            if (!res.data.success) throw new Error(`Page ${i} failed: ${res.data.cause || 'Unknown error'}`);
-            return res.data.auctions || [];
-          })
+          Promise.all(batchPages.map(page =>
+            axios.get(`${API_ENDPOINT}&page=${page}`, { timeout: 30000 }).then(res => {
+              if (!res.data.success) throw new Error(`Page ${page} failed: ${res.data.cause || 'Unknown error'}`);
+              return res.data.auctions || [];
+            })
+          ))
         );
       }
-      const allPagesData = await Promise.all(pagePromises);
+      const allPagesData = (await Promise.all(pagePromises)).flat();
       const allAuctions = allPagesData.flat();
       console.log(`Retrieved ${allAuctions.length} auctions from API`);
 
-      // Store new auctions in historical collection, excluding duplicates
       let newAuctionsCount = 0;
       for (const auction of allAuctions) {
-        const exists = await HistoricalAuction.exists({ _id: auction.uuid });
-        if (!exists) {
-          const newHistoricalAuction = new HistoricalAuction({
-            _id: auction.uuid,
-            item_name: auction.item_name,
-            starting_bid: auction.starting_bid,
-            tier: auction.tier,
-            bin: auction.bin,
-            end: auction.end, // Hypixel end time in milliseconds
-            auctioneer: auction.auctioneer
-          });
-          await newHistoricalAuction.save();
-          newAuctionsCount++;
+        try {
+          const exists = await HistoricalAuction.exists({ _id: auction.uuid });
+          if (!exists) {
+            const newHistoricalAuction = new HistoricalAuction({
+              _id: auction.uuid,
+              item_name: auction.item_name,
+              starting_bid: auction.starting_bid,
+              tier: auction.tier,
+              bin: auction.bin,
+              end: auction.end,
+              auctioneer: auction.auctioneer
+            });
+            await newHistoricalAuction.save({ upsert: true, runValidators: true });
+            newAuctionsCount++;
+          }
+        } catch (error) {
+          if (error.code === 11000) {
+            console.warn(`Duplicate UUID ${auction.uuid} ignored: ${error.message}`);
+          } else {
+            throw error;
+          }
         }
       }
       console.log(`Cached ${newAuctionsCount} new unique auctions in history`);
 
-      // Clean up expired auctions
       await cleanupExpiredAuctions();
 
-      // Update current auctions (Auction collection)
       console.log('Dropping old auctions...');
       await Auction.collection.drop().catch(err => {
         if (err.codeName !== 'NamespaceNotFound') throw err;
@@ -117,7 +120,7 @@ async function fetchAuctionsWithRetry(retries = 3, delay = 30000) {
       const batchSize = 1000;
       for (let i = 0; i < allAuctions.length; i += batchSize) {
         const batch = allAuctions.slice(i, i + batchSize);
-        await Auction.insertMany(batch, { ordered: false }); // Ordered: false to continue on duplicate errors
+        await Auction.insertMany(batch, { ordered: false });
         console.log(`Inserted batch ${i / batchSize + 1} of ${Math.ceil(allAuctions.length / batchSize)}`);
       }
       console.log(`Cached ${allAuctions.length} auctions successfully`);
@@ -129,11 +132,12 @@ async function fetchAuctionsWithRetry(retries = 3, delay = 30000) {
         attempt,
         timestamp: new Date().toISOString()
       });
-      if (error.code === 'ECONNABORTED') {
+      if (error.response?.status === 429) {
+        const waitTime = Math.min(60000 * attempt, 300000); // Up to 5 minutes
+        console.error(`Rate limit hit (429). Retrying in ${waitTime / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      } else if (error.code === 'ECONNABORTED') {
         console.error(`Request timed out (Attempt ${attempt}/${retries}). Retrying in ${delay / 1000} seconds...`);
-      } else if (error.response && error.response.status === 429) {
-        console.error('Rate limit hit (429). Retrying in 60 seconds...');
-        await new Promise(resolve => setTimeout(resolve, 60000));
       } else {
         console.error('Unexpected error. Retrying...');
       }
@@ -143,7 +147,7 @@ async function fetchAuctionsWithRetry(retries = 3, delay = 30000) {
   }
 }
 
-// Cleanup function for expired auctions (manual, as TTL with milliseconds is unreliable)
+// Cleanup function for expired auctions
 async function cleanupExpiredAuctions() {
   const now = Date.now();
   try {
@@ -154,16 +158,22 @@ async function cleanupExpiredAuctions() {
   }
 }
 
-// Schedule cleanup every 5 minutes (aligned with auction fetch for timely removal)
-cron.schedule('*/5 * * * *', cleanupExpiredAuctions); // Every 5 minutes, aligned with auction fetch
+// Schedule cleanup every 5 minutes
+cron.schedule('*/5 * * * *', cleanupExpiredAuctions);
 
-// Schedule fetching every 5 minutes (continuous caching)
-cron.schedule('*/5 * * * *', () => {
-  fetchAuctionsWithRetry()
-    .catch(err => console.error('Cron job failed:', err.message));
-});
+// Schedule fetching every 5 minutes (deferred after server start)
+let fetchScheduled = false;
+function scheduleFetch() {
+  if (!fetchScheduled) {
+    fetchScheduled = true;
+    cron.schedule('*/5 * * * *', () => {
+      fetchAuctionsWithRetry()
+        .catch(err => console.error('Cron job failed:', err.message));
+    });
+  }
+}
 
-// Search Endpoint (current auctions, querying cached data from 'test' database)
+// Search Endpoint
 app.get('/auctions/search', async (req, res) => {
   const { item, rarity, bin, skip } = req.query;
   let query = {};
@@ -178,7 +188,7 @@ app.get('/auctions/search', async (req, res) => {
       .sort({ starting_bid: 1 })
       .skip(skipValue)
       .limit(100)
-      .lean() // Use lean for faster queries
+      .lean()
       .exec();
     console.log(`Search for ${JSON.stringify(req.query)} returned ${auctions.length} auctions from 'test.auctions'`);
     res.json(auctions);
@@ -188,21 +198,23 @@ app.get('/auctions/search', async (req, res) => {
   }
 });
 
-// Health check endpoint for frontend verification
+// Health check endpoint
 app.get('/health', async (req, res) => {
   try {
     await mongoose.connection.db.admin().ping();
-    res.json({ connected: true, message: 'MongoDB connection healthy' });
+    res.json({ connected: true, message: 'MongoDB connection healthy', timestamp: new Date().toISOString() });
   } catch (error) {
     console.error('Health check error:', error.message);
-    res.status(500).json({ connected: false, message: 'MongoDB connection failed' });
+    res.status(500).json({ connected: false, message: 'MongoDB connection failed', error: error.message });
   }
 });
 
-// Start Server
-const PORT = 3000;
+// Start server and bind to $PORT immediately, then schedule fetch
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT} at ${new Date().toISOString()}`);
-  fetchAuctionsWithRetry() // Initial fetch (starts caching immediately upon deployment)
+  // Schedule the initial fetch after server starts
+  fetchAuctionsWithRetry()
+    .then(() => scheduleFetch())
     .catch(err => console.error('Initial fetch failed:', err.message));
 });
